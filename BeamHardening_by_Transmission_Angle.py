@@ -207,8 +207,10 @@ def fprepare_conversion(input_hdf_name = None):
     if input_hdf_name is None:
         input_hdf_name = hdf_fname
     with h5py.File(input_hdf_name,'r') as hdf_file:
-        global trans_fit_coeffs = hdf_file['Fit_Coeff']
-        global angle_fit_coeffs = hdf_file['Angular_Fits']
+        global trans_fit_coeffs
+        trans_fit_coeffs = hdf_file['Fit_Coeff']
+        global angle_fit_coeffs
+        angle_fit_coeffs = hdf_file['Angular_Fits']
 
 def fconvert_to_pathlength(input_trans):
     '''Corrects for the beam hardening, assuming we are in the ring plane.
@@ -226,7 +228,7 @@ def fcorrect_angular(pathlength_image,center_row,d_source_m,pixel_size_mm):
     angles *= pixel_size_mm / d_source_m * 1e3
     correction_factor = np.polyval(angle_fit_coeffs,angles)
     return pathlength_image * correction_factor[:,None]
-    
+
 def fmake_plots_angular():
     '''Make plots to see how the fits change for different angular positions.
     '''
@@ -248,10 +250,10 @@ def fmake_plots_angular():
         plt.ylabel('Transmission')
         plt.figure(2)
         plt.plot(transmissions,correlation_curves[0]/sample_thick_interp,label=r'{0:d} $\mu$rad'.format(i))
-    plt.figure(1)    
-    plt.legend(loc='lower right')
+    plt.figure(1)
+    plt.legend(loc='lower right', fontsize=6)
     plt.figure(2)
-    plt.legend(loc='lower right')
+    plt.legend(loc='lower right', fontsize=6)
     plt.show()
 
 def fmake_plots():
@@ -274,6 +276,9 @@ def fmake_plots():
         coeff = np.polyfit(np.log(transmissions),sample_thick_interp,i)
         plt.semilogy(np.polyval(coeff,np.log(transmissions)),transmissions,label=str(i))
     plt.legend(loc='upper right')
+    plt.title('Plot of different polynomial fit orders')
+    plt.xlabel('Fit Pathlength, microns')
+    plt.ylabel('Transmission')
     #Compute the curve between actual and calculated transmission
     plt.figure(3)
     assumed_absorption_coefficient = 0.001
@@ -291,11 +296,6 @@ def fmake_plots():
     plt.legend(loc='upper right')
     plt.show()
 
-#fmake_plots_angular()
 fsave_coeff_data()
-#ffind_calibration_angular()
-fmake_plots()
-fmake_plots_angular()
-# coeffs = fcompute_2d_lookup_coeffs()
-# ftest_2d_lookup(coeffs)
-    
+# fmake_plots()
+# fmake_plots_angular()

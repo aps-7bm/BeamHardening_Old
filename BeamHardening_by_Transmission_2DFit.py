@@ -26,13 +26,6 @@ spectral_energies = spectral_data[:-2,0]/1000
 spectral_power = spectral_data[:-2,1]
 filtered_power = spectral_power
 
-#Set the file to be used to write the coefficients to file.
-hdf_fname = pwd + 'Beam_Hardening_LUT.hdf5'
-
-#Global variables for when we convert images
-trans_fit_coeffs = None
-angle_fit_coeffs = None
-
 #Copy part of the Material class from Scintillator_Optimization code
 class Material:
     '''Class that defines the absorption and attenuation properties of a material.
@@ -157,145 +150,90 @@ def fcompute_lookup_coeffs(input_energies, input_spectrum, order = 5):
     detected_power = np.zeros_like(sample_thicknesses)
     for i in range(sample_thicknesses.size):
         sample_filtered_power = sample_material.fcompute_transmitted_spectrum(sample_thicknesses[i],
-                                                                              input_energies, input_spectrum)
-        detected_power[i] = scintillator_material.fcompute_absorbed_power(scintillator_thickness,
-                                                                          input_energies, sample_filtered_power)
+                                                                              spectral_energies,input_spectrum)
+        detected_power[i] = scintillator_material.fcompute_absorbed_power(scintillator_thickness,spectral_energies,sample_filtered_power)
     #Compute an effective transmission vs. thickness
     sample_effective_trans = detected_power / detected_power[0]
     #This line to give fit to transmission vs. thickness
-    return np.polyfit(np.log(sample_effective_trans),sample_thicknesses, order)
+    return np.polyfit(np.log(sample_effective_trans),sample_thicknesses,5)
 
-def ffind_calibration_angular():
-    '''Do the correlation at transmission of 10%.
-    Treat the angular dependence as a correction on the thickness vs.
-    transmission at angle = 0.
+def fcompute_2d_lookup_coeffs(trans_order = 5, angle_order = 4):
+    '''Performs a 2D least squares optimization to find the sample thickness
+    given the transmission and the angle.
     '''
     angles_urad = np.array([0,5,10,15,20,30,40])
-    cal_curve = []
-    for i in angles_urad:
-        spectral_data = np.genfromtxt(pwd+'Psi_{0:02d}urad.dat'.format(i))
+    transmissions = np.logspace(0.02,-2.48,500)
+    sample_thicknesses = np.sort(np.concatenate((np.logspace(0,2.0,31),np.logspace(2.0,4.5,121)))) 
+    A = np.zeros((sample_thicknesses.shape[0] * angles_urad.shape[0],trans_order + angle_order + 1))
+    b = np.tile(sample_thicknesses,angles_urad.shape[0])
+    for i,urad in enumerate(angles_urad):
+        print('Opening new angle = {0:3d} urad.'.format(urad))
+        spectral_data = np.genfromtxt(pwd+'Psi_{0:02d}urad.dat'.format(urad))
         spectral_energies = spectral_data[:-2,0]/1000
         spectral_power = spectral_data[:-2,1]
         #Filter the beam
         filtered_spectrum = fapply_filters(filters,spectral_energies,spectral_power)
-        #Create an interpolation function based on this
-        sample_interp_coeffs = fcompute_lookup_coeffs(spectral_energies,filtered_spectrum)
-        cal_curve.append(np.polyval(sample_interp_coeffs,np.log(0.1)))
-    coeffs = np.polyfit(angles_urad,cal_curve,4)
-    with h5py.File(hdf_fname,'r+') as hdf_file:
-        hdf_file.create_dataset('Angular_Fits',data=coeffs)
+        zero_thickness_power = 0
+        for j in range(sample_thicknesses.size):
+            sample_filtered_power = sample_material.fcompute_transmitted_spectrum(sample_thicknesses[j],
+                                                                                  spectral_energies,filtered_spectrum)
+            detected_power = scintillator_material.fcompute_absorbed_power(scintillator_thickness,spectral_energies,sample_filtered_power)
+            if j == 0:
+                zero_thickness_power = detected_power
+            trans = detected_power / zero_thickness_power
+            A_row = np.zeros((trans_order + angle_order + 1))
+            A_row[0] = 1
+            for k in range(trans_order):
+                A_row[1 + k] = np.log(trans)**(k+1)
+            for k in range(angle_order-1):
+                A_row[1 + trans_order + k] = urad**(k+2)
+            A_row[-1] = np.log(trans)**2 * urad**2
+            A[j + sample_thicknesses.shape[0] * i,:] = A_row
+    #Perform least squares fit
+    output = np.linalg.lstsq(A,b)
+    print(output)
+    with h5py.File('Beam_Hardening_LUT_Raytheon.hdf5','w') as hdf_file:
+        hdf_file.create_dataset('Angular_Fits',data=output[0])
+    return(output[0])
 
-def fsave_coeff_data():
-    '''Convert transmission data to material pathlength in microns.
-    '''
-    #Filter the beam
-    filtered_spectrum = fapply_filters(filters)
-    #Create an interpolation function based on this
+def fevaluate_2d_lookup(coeffs,angle,trans):
+    c = np.zeros((6,5))
+    c[0,0] = coeffs[0]
+    c[1:,0] = coeffs[1:6]
+    c[0,2:] = coeffs[6:9]
+    c[2,2] = coeffs[9]
+    return np.polynomial.polynomial.polyval2d(np.log(trans),angle,c)
+
+def ftest_2d_lookup(coeffs):
+    plt.figure(1)
     transmissions = np.logspace(0.02,-2.48,500)
-    sample_interp_coeffs = fcompute_lookup_coeffs(spectral_energies,filtered_spectrum)
-    sample_thick_interp = np.polyval(sample_interp_coeffs,np.log(transmissions))
-    with h5py.File(hdf_fname,'w') as hdf_file:
-        hdf_file.create_dataset('Transmission',data=transmissions)
-        hdf_file.create_dataset('Microns_Sample',data=sample_thick_interp)
-        hdf_file.create_dataset('Fit_Coeff',data=sample_interp_coeffs)
-        hdf_file.attrs['Sample Material'] = sample_material.name
-        for filt_key in filters.keys():
-            hdf_file.attrs['Filter {0:s} Thickness, um'.format(filt_key.name)] = filters[filt_key]
-    ffind_calibration_angular()
-
-def fprepare_conversion(input_hdf_name = None):
-    if input_hdf_name is None:
-        input_hdf_name = hdf_fname
-    with h5py.File(input_hdf_name,'r') as hdf_file:
-        global trans_fit_coeffs = hdf_file['Fit_Coeff']
-        global angle_fit_coeffs = hdf_file['Angular_Fits']
-
-def fconvert_to_pathlength(input_trans):
-    '''Corrects for the beam hardening, assuming we are in the ring plane.
-    Input: transmission
-    Output: sample pathlength in microns.
-    '''
-    return np.polyval(trans_fit_coeffs,np.log(input_trans))
-
-def fcorrect_angular(pathlength_image,center_row,d_source_m,pixel_size_mm):
-    '''Corrects for the angular dependence of the BM spectrum.
-    First, use fconvert_data to get in terms of pathlength assuming we are
-    in the ring plane.  Then, use this function to correct.
-    '''
-    angles = np.abs(np.arange(pathlength_image.shape[0]) - center_row)
-    angles *= pixel_size_mm / d_source_m * 1e3
-    correction_factor = np.polyval(angle_fit_coeffs,angles)
-    return pathlength_image * correction_factor[:,None]
-    
-def fmake_plots_angular():
-    '''Make plots to see how the fits change for different angular positions.
-    '''
-    correlation_curves = []
-    for i in [0,5,10,15,20,30,40]:
-        spectral_data = np.genfromtxt(pwd+'Psi_{0:02d}urad.dat'.format(i))
+    plt.semilogy(fevaluate_2d_lookup(coeffs,0,transmissions),transmissions)
+    plt.show()
+    angles_urad = np.array([0,5,10,15,20,30,40])
+    sample_thicknesses = np.sort(np.concatenate((np.logspace(0,2.0,31),np.logspace(2.0,4.5,121)))) 
+    for i,urad in enumerate(angles_urad):
+        print('Opening new angle = {0:3d} urad.'.format(urad))
+        spectral_data = np.genfromtxt(pwd+'Psi_{0:02d}urad.dat'.format(urad))
         spectral_energies = spectral_data[:-2,0]/1000
         spectral_power = spectral_data[:-2,1]
         #Filter the beam
         filtered_spectrum = fapply_filters(filters,spectral_energies,spectral_power)
-        #Create an interpolation function based on this
-        transmissions = np.logspace(0.02,-2.48,500)
-        sample_interp_coeffs = fcompute_lookup_coeffs(spectral_energies,filtered_spectrum)
-        sample_thick_interp = np.polyval(sample_interp_coeffs,np.log(transmissions))
-        correlation_curves.append(sample_thick_interp)
-        plt.figure(1)
-        plt.semilogy(sample_thick_interp,transmissions,label=r'{0:d} $\mu$rad'.format(i))
-        plt.xlabel(r'Material Thickness, $\mu$m')
-        plt.ylabel('Transmission')
-        plt.figure(2)
-        plt.plot(transmissions,correlation_curves[0]/sample_thick_interp,label=r'{0:d} $\mu$rad'.format(i))
-    plt.figure(1)    
-    plt.legend(loc='lower right')
-    plt.figure(2)
-    plt.legend(loc='lower right')
-    plt.show()
+        effective_trans = np.zeros_like(sample_thicknesses)
+        for j in range(sample_thicknesses.size):
+            sample_filtered_power = sample_material.fcompute_transmitted_spectrum(sample_thicknesses[j],
+                                                                                  spectral_energies,filtered_spectrum)
+            effective_trans[j] = scintillator_material.fcompute_absorbed_power(scintillator_thickness,spectral_energies,sample_filtered_power)
+        #Normalize by the case with no sample
+        effective_trans /= effective_trans[0]
+        plt.figure()
+        plt.semilogy(sample_thicknesses,effective_trans,'r.')
+        fit_thickness = fevaluate_2d_lookup(coeffs,urad,effective_trans)
+        plt.semilogy(fit_thickness,effective_trans,'b.')
+        plt.xlim(-100,1000)
+        plt.ylim(0.1,1)
+        plt.title('Angle = {0:d} urad'.format(urad))
+        plt.show()
 
-def fmake_plots():
-    #Filter the beam
-    filtered_spectrum = fapply_filters(filters)
-    #Create an interpolation function based on this
-    transmissions = np.logspace(0.02,-2.48,500)
-    sample_interp_coeffs = fcompute_lookup_coeffs(spectral_energies,filtered_spectrum)
-    sample_thick_interp = np.polyval(sample_interp_coeffs,np.log(transmissions))
-    plt.figure()
-    plt.plot(sample_thick_interp,transmissions)
-    plt.xlabel(r'Material Thickness, $\mu$m')
-    plt.ylabel('Transmission')
-    plt.figure()
-    plt.semilogy(sample_thick_interp,transmissions,label="Interp")
-    plt.xlabel(r'Material Thickness, $\mu$m')
-    plt.ylabel('Transmission')
-    print(zip(np.log(transmissions),sample_thick_interp))
-    for i in range(2,5):
-        coeff = np.polyfit(np.log(transmissions),sample_thick_interp,i)
-        plt.semilogy(np.polyval(coeff,np.log(transmissions)),transmissions,label=str(i))
-    plt.legend(loc='upper right')
-    #Compute the curve between actual and calculated transmission
-    plt.figure(3)
-    assumed_absorption_coefficient = 0.001
-    assumed_transmission = np.exp(-assumed_absorption_coefficient * sample_thick_interp)
-    plt.loglog(transmissions, assumed_transmission,'r.',label='Data')
-    plt.figure(4)
-    plt.plot(transmissions, assumed_transmission,'r.',label='Data')
-    for i in range(2,5):
-        coeff = np.polyfit(np.log(transmissions),np.log(assumed_transmission),i)
-        print(coeff)
-        plt.figure(3)
-        plt.loglog(transmissions,np.exp(np.polyval(coeff,np.log(transmissions))),label=str(i))
-        plt.figure(4)
-        plt.plot(transmissions,np.exp(np.polyval(coeff,np.log(transmissions))),label=str(i))
-    plt.legend(loc='upper right')
-    plt.show()
-
-#fmake_plots_angular()
-fsave_coeff_data()
-#ffind_calibration_angular()
-fmake_plots()
-fmake_plots_angular()
 # coeffs = fcompute_2d_lookup_coeffs()
 # ftest_2d_lookup(coeffs)
     
