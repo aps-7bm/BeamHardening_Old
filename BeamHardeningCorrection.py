@@ -336,7 +336,7 @@ def fconvert_to_pathlength_center_only(input_trans):
     Input: transmission
     Output: sample pathlength in microns.
     """
-    return np.polyval(trans_fit_coeffs, np.log(input_trans))
+    return np.polyval(centerline_coeffs, np.log(input_trans))
 
 
 def fcorrect_angular(pathlength_image):
@@ -357,7 +357,7 @@ def fconvert_to_pathlength(input_trans):
     return fcorrect_angular(pathlength_data)
 
 
-def fconvert_to_trans(input_trans):
+def foutput_as_trans(input_trans):
     '''Corrects for beam hardening, putting data in terms of transmission at
     the equiv_energy.'''
     pathlength_data = fconvert_to_pathlength(input_trans)
