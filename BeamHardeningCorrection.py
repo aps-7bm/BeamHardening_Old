@@ -25,6 +25,26 @@ import h5py
 import os
 from pathlib import Path, PurePath
 
+
+#Global variables we need for computing LUT
+filters = {}
+sample_material = None
+scintillator_material = None
+scintillator_thickness = None
+ref_trans = None
+data_path = None
+source_data_file = None
+write_name = None
+correct_angular = None
+possible_materials = {}
+angular_fit_params = {}
+equiv_energy = 50   #keV
+
+#Global variables for when we convert images
+centerline_coeffs = None
+angular_coeffs = None
+
+
 #Copy part of the Material class from Scintillator_Optimization code
 class Material:
     '''Class that defines the absorption and attenuation properties of a material.
@@ -107,22 +127,6 @@ class Material:
         return scipy.integrate.simps(self.fcompute_absorbed_spectrum(thickness,input_energies,input_spectral_power),
                                      input_energies)
 
-#Global variables we need for computing LUT
-filters = {}
-sample_material = None
-scintillator_material = None
-scintillator_thickness = None
-ref_trans = None
-data_path = None
-source_data_file = None
-write_name = None
-correct_angular = None
-possible_materials = {}
-angular_fit_params = {}
-
-#Global variables for when we convert images
-trans_fit_coeffs = None
-angle_fit_coeffs = None
 
 def fread_config_file(config_filename='setup.cfg'):
     '''Read in parameters for beam hardening corrections from file.
@@ -182,6 +186,9 @@ def fread_config_file(config_filename='setup.cfg'):
                     correct_angular = True
                 else:
                     correct_angular = False
+            elif line.startswith('equiv_energy'):
+                global equiv_energy
+                equiv_energy = float(line.split(':')[1].strip())
             for var in ['ref_trans','center_row','d_source_m','pixel_size_mm']:
                 if line.startswith(var):
                     angular_fit_params[var] = float(line.split(':')[1])
@@ -197,6 +204,7 @@ def fread_config_file(config_filename='setup.cfg'):
     global scintillator_material
     scintillator_material = possible_materials[scintillator_name]
 
+
 def fread_source_data():
     '''Reads the spectral power data from file.
     Data file comes from the BM spectrum module in XOP.
@@ -208,6 +216,7 @@ def fread_source_data():
         return spectral_energies, spectral_power
     else:
         raise IOError
+
 
 def fapply_filters(filters, input_energies, input_spectral_power):
     '''Computes the spectrum after all filters.
@@ -222,9 +231,10 @@ def fapply_filters(filters, input_energies, input_spectral_power):
     for filt, thickness in filters.items():
         temp_spectral_power = filt.fcompute_transmitted_spectrum(thickness,
                                                                  input_energies,temp_spectral_power)
-    return temp_spectral_power
+    return input_energies, temp_spectral_power
 
-def fcompute_lookup_coeffs(input_energies, input_spectrum, order = 5):
+
+def ffind_calibration_centerline(input_energies, input_spectrum, order = 5):
     '''Makes a scipy interpolation function to be used to correct images.
     '''
     #Make an array of sample thicknesses
@@ -241,6 +251,7 @@ def fcompute_lookup_coeffs(input_energies, input_spectrum, order = 5):
     #Fit a polynomial to log(transmission) vs. thickness.  This would be a line if monochromatic
     return np.polyfit(np.log(sample_effective_trans),sample_thicknesses, order)
 
+
 def ffind_calibration_angular(order=4):
     '''Do the correlation at transmission of 10%.
     Treat the angular dependence as a correction on the thickness vs.
@@ -255,48 +266,70 @@ def ffind_calibration_angular(order=4):
         spectral_energies = spectral_data[:-2,0]/1000
         spectral_power = spectral_data[:-2,1]
         #Filter the beam
-        filtered_spectrum = fapply_filters(filters,spectral_energies,spectral_power)
+        energies, filtered_spectrum = fapply_filters(filters,spectral_energies,spectral_power)
         #Create an interpolation function based on this
-        sample_interp_coeffs = fcompute_lookup_coeffs(spectral_energies,filtered_spectrum)
+        sample_interp_coeffs = ffind_calibration_centerline(spectral_energies,filtered_spectrum)
         cal_curve.append(np.polyval(sample_interp_coeffs,np.log(ref_trans)))
     cal_curve /= cal_curve[0]
-    coeffs = np.polyfit(angles_urad,cal_curve,4)
-    with h5py.File(write_name,'r+') as hdf_file:
-        hdf_file.create_dataset('Angular_Fits',data=coeffs)
+    return np.polyfit(angles_urad, cal_curve, 4)
 
-def fsave_coeff_data(spectral_energies, spectral_power):
+
+def fcompute_calibrations(order=4):
+    '''Compute fit coefficients for both centerline and angular dependence.
+    Reads in source data, applies filters, and computes coefficients.
+    '''
+    energies, spectral_power = fread_source_data()
+    if len(filters):
+        energies, spectral_power = fapply_filters(filters, energies, spectral_power)
+    global centerline_coeffs
+    centerline_coeffs = ffind_calibration_centerline(energies, spectral_power)
+    global angular_coeffs
+    angular_coeffs = ffind_calibration_angular(order)
+
+
+def fconvert_to_transmission(pathlengths, equiv_energy):
+    '''Converts pathelength values back to transmission at an equivalent energy.
+    Input pathlengths are in microns
+    '''
+    #Get absorption coefficient in cm^2/g
+    equiv_abs_coeff = sample_material.finterpolate_attenuation(equiv_energy)
+    print(equiv_abs_coeff)
+    #Convert to 1/microns
+    equiv_abs_coeff *= sample_material.fcompute_proj_density(1)
+    print(equiv_abs_coeff)
+    return np.exp(-equiv_abs_coeff * pathlengths)
+
+
+def fsave_coeff_data():
     '''Convert transmission data to material pathlength in microns.
     '''
-    #Filter the beam
-    filtered_spectrum = fapply_filters(filters, spectral_energies, spectral_power)
+    #Find calibrations
+    fcompute_calibrations()
     #Create an interpolation function based on this
     transmissions = np.logspace(0.02,-2.48,500)
-    sample_interp_coeffs = fcompute_lookup_coeffs(spectral_energies,filtered_spectrum)
-    sample_thick_interp = np.polyval(sample_interp_coeffs,np.log(transmissions))
+    sample_thick_interp = np.polyval(centerline_coeffs, np.log(transmissions))
     with h5py.File(write_name,'w') as hdf_file:
-        hdf_file.create_dataset('Transmission',data=transmissions)
-        hdf_file.create_dataset('Microns_Sample',data=sample_thick_interp)
-        hdf_file.create_dataset('Fit_Coeff',data=sample_interp_coeffs)
+        hdf_file.create_dataset('Transmission', data=transmissions)
+        hdf_file.create_dataset('Microns_Sample', data=sample_thick_interp)
+        hdf_file.create_dataset('Centerline_Coeff', data=centerline_coeffs)
+        hdf_file.create_dataset('Equiv_Transmission',
+                                data = fconvert_to_transmission(sample_thick_interp, equiv_energy))
         hdf_file.attrs['Sample Material'] = sample_material.name
+        hdf_file.attrs['Equiv_Energy, keV'] = equiv_energy
+        if correct_angular:
+            hdf_file.create_dataset('Angular_Coeff', data=angular_coeffs)
         for filt_key in filters.keys():
             hdf_file.attrs['Filter {0:s} Thickness, um'.format(filt_key.name)] = filters[filt_key]
-    if correct_angular:
-        ffind_calibration_angular()
 
-def fcompute_LUT(config_file = 'setup.cfg'):
-    '''Performs all actions to compute the LUT coefficients and save them.
-    '''
-    fread_config_file(config_file)
-    spectral_energies, spectral_power = fread_source_data()
-    fsave_coeff_data(spectral_energies, spectral_power)
 
-def fprepare_conversion(config_file = 'setup.cfg'):
+def fread_from_hdf(config_file = 'setup.cfg'):
     fread_config_file(config_file)
     with h5py.File(write_name,'r') as hdf_file:
         global trans_fit_coeffs
-        trans_fit_coeffs = hdf_file['Fit_Coeff']
+        trans_fit_coeffs = hdf_file['Centerline_Coeffs']
         global angle_fit_coeffs
-        angle_fit_coeffs = hdf_file['Angular_Fits']
+        angle_fit_coeffs = hdf_file['Angular_Ceoffs']
+
 
 def fconvert_to_pathlength_center_only(input_trans):
     """Corrects for the beam hardening, assuming we are in the ring plane.
@@ -304,6 +337,7 @@ def fconvert_to_pathlength_center_only(input_trans):
     Output: sample pathlength in microns.
     """
     return np.polyval(trans_fit_coeffs, np.log(input_trans))
+
 
 def fcorrect_angular(pathlength_image):
     '''Corrects for the angular dependence of the BM spectrum.
@@ -315,8 +349,16 @@ def fcorrect_angular(pathlength_image):
     correction_factor = np.polyval(angle_fit_coeffs,angles)
     return pathlength_image * correction_factor[:,None]
 
+
 def fconvert_to_pathlength(input_trans):
     '''Corrects for beam hardening, including vertical spectral variations.
     '''
     pathlength_data = fconvert_to_pathlength_center_only(input_trans)
     return fcorrect_angular(pathlength_data)
+
+
+def fconvert_to_trans(input_trans):
+    '''Corrects for beam hardening, putting data in terms of transmission at
+    the equiv_energy.'''
+    pathlength_data = fconvert_to_pathlength(input_trans)
+    return fconvert_to_transmission(pathlength_data, equiv_energy)
