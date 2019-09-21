@@ -44,7 +44,21 @@ equiv_energy = 50   #keV
 centerline_coeffs = None
 angular_coeffs = None
 
+class Spectrum:
+    '''Class to hold the spectrum: energies and spectral power.
+    '''
+    def __init__(self, energies, spectral_power):
+        if len(energies) != len(spectral_power):
+            raise ValueError
+        self.energies = energies
+        self.spectral_power = spectral_power
 
+    def fintegrated_power(self):
+        return scipy.integrate.simps(self.spectral_power, self.energies)
+    
+    def __len__(self):
+        return len(energies)
+ 
 #Copy part of the Material class from Scintillator_Optimization code
 class Material:
     '''Class that defines the absorption and attenuation properties of a material.
@@ -85,21 +99,20 @@ class Material:
         '''
         return thickness /1e4 * self.density
     
-    def fcompute_transmitted_spectrum(self,thickness,input_energies,input_spectral_power):
+    def fcompute_transmitted_spectrum(self,thickness,input_spectrum):
         '''Computes the transmitted spectral power through a filter.
         Inputs:
         thickness: the thickness of the filter in um
-        input_energies: numpy array of the energies for the spectrum in keV
-        input_spectral_power: spectral power for input spectrum, in numpy array
+        input_spectrum: Spectrum object for incident spectrum
         Output:
-        spectral power at same energies as input.
+        Spectrum object for transmitted intensity
         '''
         #Compute filter projected density
         filter_proj_density = self.fcompute_proj_density(thickness)
         #Find the spectral transmission using Beer-Lambert law
-        return input_spectral_power * np.exp(-self.finterpolate_attenuation(input_energies) * filter_proj_density)
+        return input_spectrum.spectral_power * np.exp(-self.finterpolate_attenuation(input_spectrum.energies) * filter_proj_density)
     
-    def fcompute_absorbed_spectrum(self,thickness,input_energies,input_spectral_power):
+    def fcompute_absorbed_spectrum(self,thickness,input_spectrum):
         '''Computes the absorbed power of a filter.
         Inputs:
         thickness: the thickness of the filter in um
@@ -111,10 +124,11 @@ class Material:
         #Compute filter projected density
         filter_proj_density = self.fcompute_proj_density(thickness)
         #Find the spectral transmission using Beer-Lambert law
-        return (np.ones_like(input_energies) - np.exp(-self.finterpolate_absorption(input_energies)
-                                                      * filter_proj_density)) * input_spectral_power
+        return (np.ones_like(len(input_spectrum)) 
+                - np.exp(-self.finterpolate_absorption(input_spectrum.energies)
+                * filter_proj_density)) * input_spectrum.spectral_power
     
-    def fcompute_absorbed_power(self,thickness,input_energies,input_spectral_power):
+    def fcompute_absorbed_power(self,thickness,input_spectrum):
         '''Computes the absorbed power of a filter.
         Inputs:
         material: the Material object for the filter
@@ -124,9 +138,8 @@ class Material:
         Output:
         absorbed power
         '''
-        return scipy.integrate.simps(self.fcompute_absorbed_spectrum(thickness,input_energies,input_spectral_power),
-                                     input_energies)
-
+        absorbed_spectrum = fcompute_absorbed_spectrum(thickness,input_spectrum)
+        return fintegrated_power(absorbed_spectrum)
 
 def fread_config_file(config_filename='setup.cfg'):
     '''Read in parameters for beam hardening corrections from file.
@@ -205,20 +218,19 @@ def fread_config_file(config_filename='setup.cfg'):
     scintillator_material = possible_materials[scintillator_name]
 
 
-def fread_source_data():
+def fread_source_data(file_name):
     '''Reads the spectral power data from file.
     Data file comes from the BM spectrum module in XOP.
     '''
     if source_data_file:
-        spectral_data = np.genfromtxt(source_data_file, comments='!')
+        spectral_data = np.genfromtxt(file_name , comments='!')
         spectral_energies = spectral_data[:-2,0] / 1000.
         spectral_power = spectral_data[:-2,1]
-        return spectral_energies, spectral_power
+        return Spectrum(spectral_energies, spectral_power)
     else:
         raise IOError
 
-
-def fapply_filters(filters, input_energies, input_spectral_power):
+def fapply_filters(filters, input_spectrum):
     '''Computes the spectrum after all filters.
         Inputs:
         filters: dictionary giving filter materials as keys and thicknesses in microns as values.
@@ -227,14 +239,13 @@ def fapply_filters(filters, input_energies, input_spectral_power):
         Output:
         spectral power transmitted through the filter set.
         '''
-    temp_spectral_power = input_spectral_power
+    temp_spectrum = input_spectrum
     for filt, thickness in filters.items():
-        temp_spectral_power = filt.fcompute_transmitted_spectrum(thickness,
-                                                                 input_energies,temp_spectral_power)
-    return input_energies, temp_spectral_power
+        temp_spectrum = filt.fcompute_transmitted_spectrum(thickness, input_spectrum)
+    return temp_spectrum
 
 
-def ffind_calibration_centerline(input_energies, input_spectrum, order = 5):
+def ffind_calibration_centerline(input_spectrum, order = 5):
     '''Makes a scipy interpolation function to be used to correct images.
     '''
     #Make an array of sample thicknesses
@@ -243,9 +254,9 @@ def ffind_calibration_centerline(input_energies, input_spectrum, order = 5):
     detected_power = np.zeros_like(sample_thicknesses)
     for i in range(sample_thicknesses.size):
         sample_filtered_power = sample_material.fcompute_transmitted_spectrum(sample_thicknesses[i],
-                                                                              input_energies, input_spectrum)
+                                                                              input_spectrum)
         detected_power[i] = scintillator_material.fcompute_absorbed_power(scintillator_thickness,
-                                                                          input_energies, sample_filtered_power)
+                                                                          sample_filtered_power)
     #Compute an effective transmission vs. thickness
     sample_effective_trans = detected_power / detected_power[0]
     #Fit a polynomial to log(transmission) vs. thickness.  This would be a line if monochromatic
@@ -253,7 +264,7 @@ def ffind_calibration_centerline(input_energies, input_spectrum, order = 5):
 
 
 def ffind_calibration_angular(order=4):
-    '''Do the correlation at transmission of 10%.
+    '''Do the correlation at the reference transmission. 
     Treat the angular dependence as a correction on the thickness vs.
     transmission at angle = 0.
     '''
@@ -261,14 +272,12 @@ def ffind_calibration_angular(order=4):
     angles_urad = np.array([0,5,10,15,20,30,40])
     cal_curve = []
     for i in angles_urad:
-        spectral_data = np.genfromtxt(PurePath.joinpath(data_path,
+        angle_spectrum = fread_source_data(PurePath.joinpath(data_path,
                                                         'Psi_{0:02d}urad.dat'.format(i)))
-        spectral_energies = spectral_data[:-2,0]/1000
-        spectral_power = spectral_data[:-2,1]
         #Filter the beam
-        energies, filtered_spectrum = fapply_filters(filters,spectral_energies,spectral_power)
+        filtered_spectrum = fapply_filters(filters, angle_spectrum)
         #Create an interpolation function based on this
-        sample_interp_coeffs = ffind_calibration_centerline(spectral_energies,filtered_spectrum)
+        sample_interp_coeffs = ffind_calibration_centerline(filtered_spectrum)
         cal_curve.append(np.polyval(sample_interp_coeffs,np.log(ref_trans)))
     cal_curve /= cal_curve[0]
     return np.polyfit(angles_urad, cal_curve, 4)
@@ -278,11 +287,11 @@ def fcompute_calibrations(order=4):
     '''Compute fit coefficients for both centerline and angular dependence.
     Reads in source data, applies filters, and computes coefficients.
     '''
-    energies, spectral_power = fread_source_data()
+    beam_spectrum = fread_source_data(PurePath.joinpath(data_path,source_data_file))
     if len(filters):
-        energies, spectral_power = fapply_filters(filters, energies, spectral_power)
+        beam_spectrum = fapply_filters(filters, beam_spectrum)
     global centerline_coeffs
-    centerline_coeffs = ffind_calibration_centerline(energies, spectral_power)
+    centerline_coeffs = ffind_calibration_centerline(beam_spectrum)
     global angular_coeffs
     angular_coeffs = ffind_calibration_angular(order)
 
