@@ -17,6 +17,16 @@ Edits: Apr 27, 2016. Dan & Katie edited fcompute_lookup_table_function to sort t
 
         January 30, 2019: set up for using a config file to avoid having to alter
             source code every time we run this code.
+        
+        September 23, 2019: set up Spectrum objects to simplify calls.
+
+Usage:
+* Run fread_config_file to load in configuration information.
+* Run fcompute_calibrations to compute the polynomial fits for correcting
+    the beam hardening
+* Run either fcorrect_as_pathlength or fcorrect_as_transmission, as desired,
+    to correct an image.
+
 '''
 import numpy as np
 import scipy.interpolate
@@ -24,6 +34,7 @@ import scipy.integrate
 import h5py
 import os
 from pathlib import Path, PurePath
+from copy import deepcopy
 
 
 #Global variables we need for computing LUT
@@ -83,12 +94,12 @@ class Material:
         return scipy.interpolate.interp1d(np.log(energies),np.log(absorptions),bounds_error=False)
     
     def finterpolate_absorption(self,input_energies):
-        '''Interpolates on log-log scale and scales back
+        '''Interpolates absorption on log-log scale and scales back
         '''
         return np.exp(self.absorption_interpolation_function(np.log(input_energies)))
     
     def finterpolate_attenuation(self,input_energies):
-        '''Interpolates on log-log scale and scales back
+        '''Interpolates attenuation on log-log scale and scales back
         '''
         return np.exp(self.attenuation_interpolation_function(np.log(input_energies)))
     
@@ -107,39 +118,41 @@ class Material:
         Output:
         Spectrum object for transmitted intensity
         '''
+        output_spectrum = deepcopy(input_spectrum)
         #Compute filter projected density
         filter_proj_density = self.fcompute_proj_density(thickness)
         #Find the spectral transmission using Beer-Lambert law
-        return input_spectrum.spectral_power * np.exp(-self.finterpolate_attenuation(input_spectrum.energies) * filter_proj_density)
+        output_spectrum.spectral_power = (input_spectrum.spectral_power 
+                    * np.exp(-self.finterpolate_attenuation(input_spectrum.energies) * filter_proj_density))
+        return output_spectrum
     
     def fcompute_absorbed_spectrum(self,thickness,input_spectrum):
         '''Computes the absorbed power of a filter.
         Inputs:
         thickness: the thickness of the filter in um
-        input_energies: numpy array of the energies for the spectrum in keV
-        input_spectral_power: spectral power for input spectrum, in numpy array
+        input_spectrum: Spectrum object for incident beam
         Output:
-        absorbed power
+        Spectrum objection for absorbed spectrum
         '''
+        output_spectrum = deepcopy(input_spectrum)
         #Compute filter projected density
         filter_proj_density = self.fcompute_proj_density(thickness)
         #Find the spectral transmission using Beer-Lambert law
-        return (np.ones_like(len(input_spectrum)) 
-                - np.exp(-self.finterpolate_absorption(input_spectrum.energies)
-                * filter_proj_density)) * input_spectrum.spectral_power
+        output_spectrum.spectral_power = (input_spectrum.spectral_power -
+                - np.exp(-self.finterpolate_absorption(input_spectrum.energies) * filter_proj_density) 
+                * input_spectrum.spectral_power)
+        return output_spectrum
     
     def fcompute_absorbed_power(self,thickness,input_spectrum):
         '''Computes the absorbed power of a filter.
         Inputs:
         material: the Material object for the filter
         thickness: the thickness of the filter in um
-        input_energies: numpy array of the energies for the spectrum in keV
-        input_spectral_power: spectral power for input spectrum, in numpy array
+        input_energies: Spectrum object for incident beam 
         Output:
         absorbed power
         '''
-        absorbed_spectrum = fcompute_absorbed_spectrum(thickness,input_spectrum)
-        return fintegrated_power(absorbed_spectrum)
+        return self.fcompute_absorbed_spectrum(thickness,input_spectrum).fintegrated_power()
 
 def fread_config_file(config_filename='setup.cfg'):
     '''Read in parameters for beam hardening corrections from file.
@@ -218,17 +231,19 @@ def fread_config_file(config_filename='setup.cfg'):
     scintillator_material = possible_materials[scintillator_name]
 
 
-def fread_source_data(file_name):
+def fread_source_data(file_name = None):
     '''Reads the spectral power data from file.
     Data file comes from the BM spectrum module in XOP.
     '''
-    if source_data_file:
+    if file_name:
         spectral_data = np.genfromtxt(file_name , comments='!')
-        spectral_energies = spectral_data[:-2,0] / 1000.
-        spectral_power = spectral_data[:-2,1]
-        return Spectrum(spectral_energies, spectral_power)
+    elif source_data_file:
+        spectral_data = np.genfromtxt(PurePath.joinpath(data_path, source_data_file), comments='!')
     else:
-        raise IOError
+        raise IOError("File not specified.")
+    spectral_energies = spectral_data[:-2,0] / 1000.
+    spectral_power = spectral_data[:-2,1]
+    return Spectrum(spectral_energies, spectral_power)
 
 def fapply_filters(filters, input_spectrum):
     '''Computes the spectrum after all filters.
@@ -239,7 +254,7 @@ def fapply_filters(filters, input_spectrum):
         Output:
         spectral power transmitted through the filter set.
         '''
-    temp_spectrum = input_spectrum
+    temp_spectrum = deepcopy(input_spectrum)
     for filt, thickness in filters.items():
         temp_spectrum = filt.fcompute_transmitted_spectrum(thickness, input_spectrum)
     return temp_spectrum
@@ -283,7 +298,7 @@ def ffind_calibration_angular(order=4):
     return np.polyfit(angles_urad, cal_curve, 4)
 
 
-def fcompute_calibrations(order=4):
+def fcompute_calibrations(centerline_order=5, angular_order=4):
     '''Compute fit coefficients for both centerline and angular dependence.
     Reads in source data, applies filters, and computes coefficients.
     '''
@@ -291,9 +306,9 @@ def fcompute_calibrations(order=4):
     if len(filters):
         beam_spectrum = fapply_filters(filters, beam_spectrum)
     global centerline_coeffs
-    centerline_coeffs = ffind_calibration_centerline(beam_spectrum)
+    centerline_coeffs = ffind_calibration_centerline(beam_spectrum, centerline_order)
     global angular_coeffs
-    angular_coeffs = ffind_calibration_angular(order)
+    angular_coeffs = ffind_calibration_angular(angular_order)
 
 
 def fconvert_to_transmission(pathlengths, equiv_energy):
@@ -310,7 +325,7 @@ def fconvert_to_transmission(pathlengths, equiv_energy):
 
 
 def fsave_coeff_data():
-    '''Convert transmission data to material pathlength in microns.
+    '''Save the correction coefficients to an HDF file.
     '''
     #Find calibrations
     fcompute_calibrations()
@@ -359,14 +374,14 @@ def fcorrect_angular(pathlength_image):
     return pathlength_image * correction_factor[:,None]
 
 
-def fconvert_to_pathlength(input_trans):
+def fcorrect_as_pathlength(input_trans):
     '''Corrects for beam hardening, including vertical spectral variations.
     '''
     pathlength_data = fconvert_to_pathlength_center_only(input_trans)
     return fcorrect_angular(pathlength_data)
 
 
-def foutput_as_trans(input_trans):
+def fcorrect_as_transmission(input_trans):
     '''Corrects for beam hardening, putting data in terms of transmission at
     the equiv_energy.'''
     pathlength_data = fconvert_to_pathlength(input_trans)

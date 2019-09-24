@@ -3,7 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 bh.fread_config_file()
-
+print(dir(bh))
 bh.fcompute_calibrations()
 
 print(bh.angular_coeffs)
@@ -20,18 +20,18 @@ def test_centerline():
     # Get the transmission of the beam through these
     bh.fread_config_file()
     bh.sample_material = bh.possible_materials['Fe']
-    energies, spectral_power = bh.fread_source_data()
+    source_spectrum = bh.fread_source_data()
     if len(bh.filters):
-        energies, spectral_power = bh.fapply_filters(bh.filters, energies, spectral_power)
+        filtered_spectrum = bh.fapply_filters(bh.filters, source_spectrum)
     # For each thickness, compute the absorbed power in the scintillator
     detected_power = np.zeros_like(Fe_thicknesses)
     for i in range(Fe_thicknesses.size):
-        sample_filtered_power = bh.sample_material.fcompute_transmitted_spectrum(Fe_thicknesses[i],
-                                                                              energies, spectral_power)
+        sample_filtered_spectrum = bh.sample_material.fcompute_transmitted_spectrum(Fe_thicknesses[i],
+                                                                              filtered_spectrum)
         detected_power[i] = bh.scintillator_material.fcompute_absorbed_power(bh.scintillator_thickness,
-                                                                          energies, sample_filtered_power)
+                                                                          sample_filtered_spectrum)
     ref_detected_power = bh.scintillator_material.fcompute_absorbed_power(bh.scintillator_thickness,
-                                                                          energies, spectral_power)
+                                                                          filtered_spectrum)
     Fe_transmission = detected_power / ref_detected_power
     #Compute the coefficients for conversions
     bh.fcompute_calibrations()
